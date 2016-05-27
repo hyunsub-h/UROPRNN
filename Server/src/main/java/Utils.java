@@ -436,6 +436,14 @@ public class Utils {
 
   }
   
+  public static double[] sumArray(double[] first, double[] second){
+	  double[] sum = new double[first.length];
+	  for(int i=0 ; i < first.length; i++){
+		  sum[i] = first[i] + second[i];
+	  }
+	  return sum;
+  }
+  
 }
 
 

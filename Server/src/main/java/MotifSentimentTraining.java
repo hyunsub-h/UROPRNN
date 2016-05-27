@@ -20,6 +20,8 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang3.Range;
 import org.apache.log4j.Logger;
+import org.apache.spark.Accumulable;
+import org.apache.spark.Accumulator;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -48,10 +50,10 @@ public class MotifSentimentTraining {
 	private static final long serialVersionUID = 812306434400716846L;
 
 	public Pair<double[], double[]> call(Pair<TrainHolder, Broadcast<List<Tree>>  > parameters) { 
-		MotifSentimentModel model = parameters.first.model;
+		MotifSentimentModel model = parameters.first.accumulatorModel.value();
 		List<Tree> trainingBatch = new ArrayList<Tree>();
-		for(int index: parameters.first.shuffledIndices){trainingBatch.add(parameters.second.value().get(index));}
-		double[] sumGradSquare = parameters.first.sumGradSquare;
+		for(int index: parameters.first.trainingIndices){trainingBatch.add(parameters.second.value().get(index));}
+		double[] sumGradSquare = parameters.first.accumulatorSumGradSquare.value();
 		
 		MotifSentimentCostAndGradient gcFunc = new MotifSentimentCostAndGradient(model, trainingBatch, neural_function);
 	    double[] theta = model.paramsToVector();
@@ -85,19 +87,16 @@ public class MotifSentimentTraining {
 
 	    double[] thetaChange = new double[theta.length]; 
 	    for(int i=0; i<theta.length;i++) {thetaChange[i] = theta[i] - thetaInitial[i];}
+	    parameters.first.accumulatorModel.add(thetaChange);
+	    
 	    double[] sumGradChange = new double[sumGradSquare.length];
 	    for(int i=0; i<sumGradSquare.length;i++) {sumGradChange[i] = sumGradSquare[i] - sumGradInitial[i];}
+	    parameters.first.accumulatorSumGradSquare.add(sumGradChange);
 
 		return new Pair<double[],double[]>(thetaChange, sumGradChange);
 	}};
         	  	
-  public static double[] sumArray(double[] first, double[] second){
-	  double[] sum = new double[first.length];
-	  for(int i=0 ; i < first.length; i++){
-		  sum[i] = first[i] + second[i];
-	  }
-	  return sum;
-  }
+
   
   public static void executeOneTrainingBatch(MotifSentimentModel model, List<Tree> trainingBatch, double[] sumGradSquare) {
     MotifSentimentCostAndGradient gcFunc = new MotifSentimentCostAndGradient(model, trainingBatch, neural_function);
@@ -130,9 +129,10 @@ public class MotifSentimentTraining {
 	  return "";
   }
   
-  public static MotifSentimentModel train_multiThread(MotifSentimentModel model, String modelPath, JavaSparkContext sc, Broadcast<List<Tree>> broadcastTrainingTrees, List<Tree> devTrees, int threadNum) {
+  public static MotifSentimentModel train_multiThread(Accumulable<MotifSentimentModel, double[]> accumulatorModel, String modelPath, JavaSparkContext sc, Broadcast<List<Tree>> broadcastTrainingTrees, List<Tree> devTrees, int threadNum) {
 	    List<Tree> trainingTrees = broadcastTrainingTrees.value();
 	  	Timing timing = new Timing();
+	  	MotifSentimentModel model = accumulatorModel.value();
 	    long maxTrainTimeMillis = model.op.trainOptions.maxTrainTimeSeconds * 1000;
 	    int debugCycle = 0;
 	    double bestCost=Double.MAX_VALUE;
@@ -149,6 +149,7 @@ public class MotifSentimentTraining {
 	    // train using AdaGrad (seemed to work best during the dvparser project)
 	    double[] sumGradSquare = new double[model.totalParamSize()];
 	    Arrays.fill(sumGradSquare, model.op.trainOptions.initialAdagradWeight);
+	    Accumulator<double[]> accumulatorSumGradSquare = sc.accumulator(sumGradSquare, new ArrayAccumulatorParam());
 	    
 	    int numBatches = trainingTrees.size() / model.op.trainOptions.batchSize ;
 	    if(numBatches*model.op.trainOptions.batchSize<trainingTrees.size() )
@@ -160,7 +161,10 @@ public class MotifSentimentTraining {
 	    System.err.println("Times through each training batch: " + model.op.trainOptions.epochs);
 	    double allbatchCost_last=Double.MAX_VALUE;
 		
+	    
 	    for (int epoch = 0; epoch < model.op.trainOptions.epochs; ++epoch) {
+
+		  	
 	      System.err.println("======================================");
 	      
 	      System.err.println("Starting epoch " + epoch);
@@ -168,7 +172,11 @@ public class MotifSentimentTraining {
 	      if (epoch > 0 && model.op.trainOptions.adagradResetFrequency > 0 && 
 	          (epoch % model.op.trainOptions.adagradResetFrequency == 0)) {
 	        System.err.println("Resetting adagrad weights to " + model.op.trainOptions.initialAdagradWeight);
-	        Arrays.fill(sumGradSquare, model.op.trainOptions.initialAdagradWeight);
+
+		    double[] negativeGradSquare = new double[model.totalParamSize()];
+	        Arrays.fill(negativeGradSquare, model.op.trainOptions.initialAdagradWeight);
+	        for(int i=0; i<negativeGradSquare.length;i++){ negativeGradSquare[i] -= accumulatorSumGradSquare.value()[i];}
+	        accumulatorSumGradSquare.add(negativeGradSquare);
 	      }
 	      
 	      List<Integer> indices = new ArrayList<Integer>();
@@ -184,26 +192,32 @@ public class MotifSentimentTraining {
   	        int endIndex = (batch + 1) * model.op.trainOptions.batchSize;
   	        if (endIndex + model.op.trainOptions.batchSize > indices.size())
   	        	endIndex = indices.size();
-  	        parameters.add(new Pair<TrainHolder, Broadcast< List<Tree> > >(new TrainHolder(model, sumGradSquare, new ArrayList<Integer>(indices.subList(startIndex, endIndex)) ), broadcastTrainingTrees));	    	  
+  	        parameters.add(new Pair<TrainHolder, Broadcast< List<Tree> > >(new TrainHolder(accumulatorModel, accumulatorSumGradSquare, new ArrayList<Integer>(indices.subList(startIndex, endIndex)) ), broadcastTrainingTrees));	    	  
 	      }
 	      
 	      JavaRDD< Pair< TrainHolder, Broadcast<List<Tree>>  > > parallelParameters = sc.parallelize(parameters);
 
-	      Pair<double[], double[]> parameterChange = parallelParameters.map(executeOneTrainingInParallel).reduce(
-	    		  new Function2<Pair<double[], double[]> , Pair<double[], double[]>, Pair<double[], double[]>>(){
-	    			  public Pair<double[], double[]> call(Pair<double[], double[]> a, Pair<double[], double[]> b){
-	    				  return new Pair<double[], double[]>(sumArray(a.first,b.first), sumArray(a.second,b.second));
-	    			  }
-	    		  });
-	      double[] theta = model.paramsToVector();
-	      theta = sumArray(theta, parameterChange.first);
-	      model.vectorToParams(theta);
+//	      Pair<double[], double[]> parameterChange = 
+	      parallelParameters.map(executeOneTrainingInParallel);
+//	      .reduce(
+//	    		  new Function2<Pair<double[], double[]> , Pair<double[], double[]>, Pair<double[], double[]>>(){
+//	    			  public Pair<double[], double[]> call(Pair<double[], double[]> a, Pair<double[], double[]> b){
+//	    				  return new Pair<double[], double[]>(Utils.sumArray(a.first,b.first), Utils.sumArray(a.second,b.second));
+//	    			  }
+//	    		  });
 	      
-	      sumGradSquare = sumArray(sumGradSquare, parameterChange.second);
+//	      double[] theta = model.paramsToVector();
+//	      theta = Utils.sumArray(theta, parameterChange.first);
+//	      model.vectorToParams(theta);
+//	      
+//	      sumGradSquare = Utils.sumArray(sumGradSquare, parameterChange.second);
 
 
-
-
+	      model = accumulatorModel.value();
+	      sumGradSquare = accumulatorSumGradSquare.value();
+	      
+	      System.err.println(model);
+	      System.err.println(sumGradSquare);
 	      long totalElapsed = timing.report();
 	      
 	      if (maxTrainTimeMillis > 0 && totalElapsed > maxTrainTimeMillis) {
@@ -605,12 +619,13 @@ public class MotifSentimentTraining {
 		SparkConf conf = new SparkConf().setAppName("MotifSentimentTraining");
 		JavaSparkContext sc = new JavaSparkContext(conf);
 		Broadcast<List<Tree>> broadcastTrainingTrees = sc.broadcast(trainingTrees);
+		Accumulable<MotifSentimentModel, double[]> accumulatorModel = sc.accumulable(model, new MotifSentimentModelAccumulatorParam());
 		
     	if(numthreads>=1)
     	{	model.op.trainOptions.batchSize=trainingTrees.size()/numthreads/2;
     		if(model.op.trainOptions.batchSize>10000)
     			model.op.trainOptions.batchSize=10000;
-    		model=train_multiThread(model, trainPath+".model"+ op.randomSeed, sc, broadcastTrainingTrees, devTrees, numthreads); //make sure final return bestmodel
+    		model=train_multiThread(accumulatorModel, trainPath+".model"+ op.randomSeed, sc, broadcastTrainingTrees, devTrees, numthreads); //make sure final return bestmodel
     	} //always use multi-thread version
 //    	else
 //    		train(model, trainPath+".model"+ op.randomSeed, trainingTrees, devTrees);
