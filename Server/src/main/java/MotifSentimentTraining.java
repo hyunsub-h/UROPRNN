@@ -52,7 +52,7 @@ public class MotifSentimentTraining {
   /*
    * Thread-safe trainingStep increment
    */
-  private static synchronized void increaseSteps(){
+  private static void increaseSteps(){
 	  trainingStep++;
   }
   /*
@@ -69,35 +69,37 @@ public class MotifSentimentTraining {
 		for(int index: parameters.first.trainingIndices){trainingBatch.add(parameters.second.value().get(index));}
 		double[] sumGradSquare = parameters.first.sumGradSquare;
 		
-		MotifSentimentCostAndGradient gcFunc = new MotifSentimentCostAndGradient(model, trainingBatch, neural_function);
-	    double[] theta = model.paramsToVector();
-	    
-	    double[] thetaInitial = new double[theta.length];
-	    for(int i=0; i<theta.length;i++) {thetaInitial[i] = theta[i];}
-	    double[] sumGradInitial = new double[sumGradSquare.length];
-	    for(int i=0; i<sumGradSquare.length;i++) {sumGradInitial[i] = sumGradSquare[i];}
-	    
-	    // AdaGrad
-	    double eps = 1e-3;
-	    double currCost = 0;
-
-	    // TODO: do we want to iterate multiple times per batch?
-	    double[] gradf = gcFunc.derivativeAt(theta);
-	    currCost = gcFunc.valueAt(theta);
-//	    System.err.println("batch cost: " + Math.sqrt(currCost/model.numClasses)); //orignial print denote the avg error
-//	    System.err.println("batch cost: " + Utils.round(currCost/model.numClasses,4)+" regClass:"+Utils.round(gcFunc.regClassificationCost/model.numClasses,2)+" regTrans:"+Utils.round(gcFunc.regTransformCost/model.numClasses,2)+" regWord:"+Utils.round(gcFunc.regWordVectorCost/model.numClasses,2));  //already normalize batch_size
-	   double maxGradient=0;
-	    for (int feature = 0; feature<gradf.length;feature++ ) {
-	      sumGradSquare[feature] = sumGradSquare[feature] + gradf[feature]*gradf[feature];
-	      theta[feature] = theta[feature] - (model.op.trainOptions.learningRate * gradf[feature]/(Math.sqrt(sumGradSquare[feature])+eps));
-	      if(gradf[feature]>maxGradient) //apply gradient clipping
-	    	  maxGradient=gradf[feature];
-	    } 
-//	    System.err.println("max Gradient: " +maxGradient);
-	    allbatchCost+=currCost;
-
-//	    model.vectorToParams(theta);   
-	    
+		double[] theta = model.paramsToVector();
+		    
+		    double[] thetaInitial = new double[theta.length];
+		    for(int i=0; i<theta.length;i++) {thetaInitial[i] = theta[i];}
+		    double[] sumGradInitial = new double[sumGradSquare.length];
+		    for(int i=0; i<sumGradSquare.length;i++) {sumGradInitial[i] = sumGradSquare[i];}
+		    
+		for(int i=0; i<parameters.first.batchIteration;i++ ){    
+			MotifSentimentCostAndGradient gcFunc = new MotifSentimentCostAndGradient(model, trainingBatch, neural_function);
+		  
+		    // AdaGrad
+		    double eps = 1e-3;
+		    double currCost = 0;
+	
+		    // TODO: do we want to iterate multiple times per batch?
+		    double[] gradf = gcFunc.derivativeAt(theta);
+		    currCost = gcFunc.valueAt(theta);
+	//	    System.err.println("batch cost: " + Math.sqrt(currCost/model.numClasses)); //orignial print denote the avg error
+	//	    System.err.println("batch cost: " + Utils.round(currCost/model.numClasses,4)+" regClass:"+Utils.round(gcFunc.regClassificationCost/model.numClasses,2)+" regTrans:"+Utils.round(gcFunc.regTransformCost/model.numClasses,2)+" regWord:"+Utils.round(gcFunc.regWordVectorCost/model.numClasses,2));  //already normalize batch_size
+		   double maxGradient=0;
+		    for (int feature = 0; feature<gradf.length;feature++ ) {
+		      sumGradSquare[feature] = sumGradSquare[feature] + gradf[feature]*gradf[feature];
+		      theta[feature] = theta[feature] - (model.op.trainOptions.learningRate * gradf[feature]/(Math.sqrt(sumGradSquare[feature])+eps));
+		      if(gradf[feature]>maxGradient) //apply gradient clipping
+		    	  maxGradient=gradf[feature];
+		    } 
+	//	    System.err.println("max Gradient: " +maxGradient);
+		    allbatchCost+=currCost;
+	
+	//	    model.vectorToParams(theta);   
+		}
 
 	    double[] thetaChange = new double[theta.length]; 
 	    for(int i=0; i<theta.length;i++) {thetaChange[i] = theta[i] - thetaInitial[i];}
@@ -288,10 +290,10 @@ public class MotifSentimentTraining {
 		  	      	Collections.shuffle(indices, model.rand);
 		  	      	List< Pair< TrainHolder, Broadcast<List<Tree>>  > > parameters = new ArrayList< Pair<TrainHolder, Broadcast<List<Tree>> > >();
 		  	      	
-		  	      	for(int j=0 ; j<batchIteration ; j++){
-		  	      		parameters.add(new Pair<TrainHolder, Broadcast< List<Tree> > >(new TrainHolder(model, sumGradSquare, new ArrayList<Integer>(indices.subList(0, model.op.trainOptions.batchSize-1)) ), broadcastTrainingTrees));	    	  
-		  	      	}
-			      
+//		  	      	for(int j=0 ; j<batchIteration ; j++){
+		  	      		parameters.add(new Pair<TrainHolder, Broadcast< List<Tree> > >(new TrainHolder(model, sumGradSquare, new ArrayList<Integer>(indices.subList(0, model.op.trainOptions.batchSize-1)),batchIteration ), broadcastTrainingTrees));	    	  
+//		  	      	}
+			    
 		  	      	JavaRDD< Pair< TrainHolder, Broadcast<List<Tree>>  > > parallelParameters = sc.parallelize(parameters);
 
 		  	      	Pair<double[], double[]> parameterChange = parallelParameters.map(executeOneTrainingInParallel).first();
@@ -309,10 +311,11 @@ public class MotifSentimentTraining {
 	       );
 	    }
 	    
+	    // numTrainingSteps+1? numTrainingSteps?
 	    for (int i = 0; i < numTrainingSteps+1; i++) {
 	    	Pair<double[], double[]> parameterChange;
 
-        	System.err.println(i + "th steps finished?");
+//        	System.err.println(i + "th steps finished?");
             try {
             	parameterChange = completionService.take().get(); // find the first completed task
             	if(parameterChange != null){
@@ -353,11 +356,12 @@ public class MotifSentimentTraining {
 		  			      }
 		  	      	}
             	}
-            	System.err.println(i + "th steps finished");
+//            	System.err.println(i + "th steps finished");
             } catch (InterruptedException e) {
             } catch (ExecutionException e) {
             }
         }
+	   threadPool.shutdown();
 	    
 	      //check the investigate examples:
 	    if(Utils.findNonExchangableExample)
@@ -801,6 +805,8 @@ public class MotifSentimentTraining {
     {
     	
     	System.err.println("output number of predictions:"+devTrees.size());
+
+//        System.exit(0);
     	 model.GetAllWordsImportance();
         File file = new File (devPath+".predict");
         PrintWriter printWriter;
@@ -818,7 +824,6 @@ public class MotifSentimentTraining {
 		}
 
     }
-
 
   }
 }
