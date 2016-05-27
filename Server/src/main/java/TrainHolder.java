@@ -1,21 +1,16 @@
 import java.io.Serializable;
 import java.util.List;
 
-import org.apache.spark.Accumulable;
-import org.apache.spark.Accumulator;
-
-import edu.stanford.nlp.trees.Tree;
-
 public class TrainHolder  implements Serializable {
-	public Accumulable<MotifSentimentModel, double[]> accumulatorModel;
+	public MotifSentimentModel model;
 //	public List<Tree> trainingTrees;
-	public Accumulator<double[]>  accumulatorSumGradSquare;
+	public double[]  sumGradSquare;
 	public List<Integer> trainingIndices;
 	
-	public TrainHolder(Accumulable<MotifSentimentModel, double[]> accumulatorModel, Accumulator<double[]> accumulatorSumGradSquare, List<Integer> trainingIndices){
-		this.accumulatorModel = accumulatorModel;
+	public TrainHolder(MotifSentimentModel model, double[] sumGradSquare, List<Integer> trainingIndices){
+		this.model = model;
 //		this.trainingTrees = trainingTree;
-		this.accumulatorSumGradSquare = accumulatorSumGradSquare;
+		this.sumGradSquare = sumGradSquare;
 		this.trainingIndices = trainingIndices;
 	}
 

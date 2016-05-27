@@ -14,14 +14,16 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.Map.Entry;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang3.Range;
 import org.apache.log4j.Logger;
-import org.apache.spark.Accumulable;
-import org.apache.spark.Accumulator;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -45,15 +47,27 @@ public class MotifSentimentTraining {
   public static TransformFunction neural_function=new TanhTransform();
   private static double allbatchCost=0;
   
+  private static int trainingStep = 0;
+  
+  /*
+   * Thread-safe trainingStep increment
+   */
+  private static synchronized void increaseSteps(){
+	  trainingStep++;
+  }
+  /*
+   * @author Hyun Sub
+   * Map function that trains model and return the differences in theta (in model) and sumGradSquare 
+   */
 	public static Function< Pair<TrainHolder, Broadcast<List<Tree>>  >, Pair<double[], double[]> > executeOneTrainingInParallel = new Function< Pair<TrainHolder, Broadcast<List<Tree>> >, Pair<double[], double[] >>(){
 	
 	private static final long serialVersionUID = 812306434400716846L;
 
 	public Pair<double[], double[]> call(Pair<TrainHolder, Broadcast<List<Tree>>  > parameters) { 
-		MotifSentimentModel model = parameters.first.accumulatorModel.value();
+		MotifSentimentModel model = parameters.first.model;
 		List<Tree> trainingBatch = new ArrayList<Tree>();
 		for(int index: parameters.first.trainingIndices){trainingBatch.add(parameters.second.value().get(index));}
-		double[] sumGradSquare = parameters.first.accumulatorSumGradSquare.value();
+		double[] sumGradSquare = parameters.first.sumGradSquare;
 		
 		MotifSentimentCostAndGradient gcFunc = new MotifSentimentCostAndGradient(model, trainingBatch, neural_function);
 	    double[] theta = model.paramsToVector();
@@ -87,16 +101,14 @@ public class MotifSentimentTraining {
 
 	    double[] thetaChange = new double[theta.length]; 
 	    for(int i=0; i<theta.length;i++) {thetaChange[i] = theta[i] - thetaInitial[i];}
-	    parameters.first.accumulatorModel.add(thetaChange);
 	    
 	    double[] sumGradChange = new double[sumGradSquare.length];
 	    for(int i=0; i<sumGradSquare.length;i++) {sumGradChange[i] = sumGradSquare[i] - sumGradInitial[i];}
-	    parameters.first.accumulatorSumGradSquare.add(sumGradChange);
 
 		return new Pair<double[],double[]>(thetaChange, sumGradChange);
 	}};
         	  	
-
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   
   public static void executeOneTrainingBatch(MotifSentimentModel model, List<Tree> trainingBatch, double[] sumGradSquare) {
     MotifSentimentCostAndGradient gcFunc = new MotifSentimentCostAndGradient(model, trainingBatch, neural_function);
@@ -129,109 +141,102 @@ public class MotifSentimentTraining {
 	  return "";
   }
   
-  public static MotifSentimentModel train_multiThread(Accumulable<MotifSentimentModel, double[]> accumulatorModel, String modelPath, JavaSparkContext sc, Broadcast<List<Tree>> broadcastTrainingTrees, List<Tree> devTrees, int threadNum) {
-	    List<Tree> trainingTrees = broadcastTrainingTrees.value();
-	  	Timing timing = new Timing();
-	  	MotifSentimentModel model = accumulatorModel.value();
+  public static MotifSentimentModel train_multiThread(MotifSentimentModel inputModel, final String modelPath, final JavaSparkContext sc, final Broadcast<List<Tree>> broadcastTrainingTrees, final List<Tree> devTrees, int threadNum, final int batchIteration){
+
+	    final MotifSentimentModel model = inputModel;  
+	    final List<Tree> trainingTrees = broadcastTrainingTrees.value();
+	  	final Timing timing = new Timing();
 	    long maxTrainTimeMillis = model.op.trainOptions.maxTrainTimeSeconds * 1000;
 	    int debugCycle = 0;
 	    double bestCost=Double.MAX_VALUE;
-	    String bestModelStr="";
-	    MotifSentimentModel bestModel=null;
 	    List<List<Tree>> InvestigateExamples=null;
 	    if(Utils.findNonExchangableExample)
 	    {
 	     InvestigateExamples = ExampleFinder.exchangeGrammarFailed_Examples(trainingTrees);
 	    System.out.println("Number of InvestigateExamples is "+InvestigateExamples.size());
 	    }
-	    double bestAccuracy = 0.0;
 	    OneTrainingBatchThread.tempPath=modelPath+".tmp";
 	    // train using AdaGrad (seemed to work best during the dvparser project)
-	    double[] sumGradSquare = new double[model.totalParamSize()];
+	    final double[] sumGradSquare = new double[model.totalParamSize()];
 	    Arrays.fill(sumGradSquare, model.op.trainOptions.initialAdagradWeight);
-	    Accumulator<double[]> accumulatorSumGradSquare = sc.accumulator(sumGradSquare, new ArrayAccumulatorParam());
 	    
 	    int numBatches = trainingTrees.size() / model.op.trainOptions.batchSize ;
 	    if(numBatches*model.op.trainOptions.batchSize<trainingTrees.size() )
 	    {
 	    	numBatches+=1;
 	    }
-
+	    
 	    System.err.println("Training on " + trainingTrees.size() + " trees in " + numBatches + " batches");
 	    System.err.println("Times through each training batch: " + model.op.trainOptions.epochs);
 	    double allbatchCost_last=Double.MAX_VALUE;
 		
 	    
-	    for (int epoch = 0; epoch < model.op.trainOptions.epochs; ++epoch) {
+	    // To be called in callable
+	    final List<Double> bestAccuracy = new ArrayList<Double>(Arrays.asList(0.0));
+	    final List<String> bestModelStr = new ArrayList<String>(Arrays.asList(""));
+	    final List<MotifSentimentModel> bestModel = new ArrayList<MotifSentimentModel>();
+	    bestModel.add(null);
+	    
+	    // TODO: optimize the number of threads?
+	    ExecutorService threadPool = Executors.newScheduledThreadPool(Math.max(threadNum, 2));
+        CompletionService<Pair<double[], double[]>> completionService = new ExecutorCompletionService<Pair<double[], double[]>>(threadPool);
+        
+        final int numTrainingSteps = numBatches * model.op.trainOptions.epochs /batchIteration;
+        
+	    /*
+	     * Infinitely run testing until all training steps are finished
+	     */
+	    completionService.submit(new Callable<Pair<double[], double[]>>(){
+	    	public Pair<double[], double[]> call() throws Exception{
+	    		while(true){
+	    			if(trainingStep==0)
+	    				Thread.sleep(10000);
+	    			if(trainingStep == numTrainingSteps)
+	    				break;
 
-		  	
-	      System.err.println("======================================");
-	      
-	      System.err.println("Starting epoch " + epoch);
-	      
-	      if (epoch > 0 && model.op.trainOptions.adagradResetFrequency > 0 && 
-	          (epoch % model.op.trainOptions.adagradResetFrequency == 0)) {
-	        System.err.println("Resetting adagrad weights to " + model.op.trainOptions.initialAdagradWeight);
-
-		    double[] negativeGradSquare = new double[model.totalParamSize()];
-	        Arrays.fill(negativeGradSquare, model.op.trainOptions.initialAdagradWeight);
-	        for(int i=0; i<negativeGradSquare.length;i++){ negativeGradSquare[i] -= accumulatorSumGradSquare.value()[i];}
-	        accumulatorSumGradSquare.add(negativeGradSquare);
-	      }
-	      
-	      List<Integer> indices = new ArrayList<Integer>();
-	      for(int i=0;i<trainingTrees.size();i++) {indices.add(i);}
-	      Collections.shuffle(indices, model.rand);
-//	      List<Tree> shuffledSentences = Generics.newArrayList(trainingTrees);
-//	      Collections.shuffle(shuffledSentences, model.rand);
-	      allbatchCost=0;
-	      
-	      List< Pair< TrainHolder, Broadcast<List<Tree>>  > > parameters = new ArrayList< Pair<TrainHolder, Broadcast<List<Tree>> > >();
-	      for(int batch=0;batch<numBatches;batch++) {
-  	        int startIndex = batch * model.op.trainOptions.batchSize;
-  	        int endIndex = (batch + 1) * model.op.trainOptions.batchSize;
-  	        if (endIndex + model.op.trainOptions.batchSize > indices.size())
-  	        	endIndex = indices.size();
-  	        parameters.add(new Pair<TrainHolder, Broadcast< List<Tree> > >(new TrainHolder(accumulatorModel, accumulatorSumGradSquare, new ArrayList<Integer>(indices.subList(startIndex, endIndex)) ), broadcastTrainingTrees));	    	  
-	      }
-	      
-	      JavaRDD< Pair< TrainHolder, Broadcast<List<Tree>>  > > parallelParameters = sc.parallelize(parameters);
-
-//	      Pair<double[], double[]> parameterChange = 
-	      parallelParameters.map(executeOneTrainingInParallel);
-//	      .reduce(
-//	    		  new Function2<Pair<double[], double[]> , Pair<double[], double[]>, Pair<double[], double[]>>(){
-//	    			  public Pair<double[], double[]> call(Pair<double[], double[]> a, Pair<double[], double[]> b){
-//	    				  return new Pair<double[], double[]>(Utils.sumArray(a.first,b.first), Utils.sumArray(a.second,b.second));
-//	    			  }
-//	    		  });
-	      
-//	      double[] theta = model.paramsToVector();
-//	      theta = Utils.sumArray(theta, parameterChange.first);
-//	      model.vectorToParams(theta);
-//	      
-//	      sumGradSquare = Utils.sumArray(sumGradSquare, parameterChange.second);
-
-
-	      model = accumulatorModel.value();
-	      sumGradSquare = accumulatorSumGradSquare.value();
-	      
-	      System.err.println(model);
-	      System.err.println(sumGradSquare);
-	      long totalElapsed = timing.report();
-	      
-	      if (maxTrainTimeMillis > 0 && totalElapsed > maxTrainTimeMillis) {
-	        System.err.println("Max training time exceeded, exiting");
-	        break;
-	      }
-	      
-	      System.gc();
-	      
-	      
-	        if ( epoch > 0 && epoch % model.op.trainOptions.debugOutputEpochs == 0) {
-	            double score = 0.0;
+	    		    long totalElapsed = timing.report();
+	    			double score = 0.0;
+		            System.err.println("======================================");
+		            System.out.println("Finished training step " + trainingStep + "; total training time " + totalElapsed + " ms");
+		            if (devTrees != null) {
+		              MotifEvaluate eval = new MotifEvaluate(model);
+		              if(Utils.RNNdoubleTest)
+		              {
+		              	System.out.println("Double testing...........");
+		              	 eval.eval(new ArrayList<Tree>( devTrees.subList(0, devTrees.size()/2) ) );
+		                   eval.printSummary();
+		                   String stateString="";
+		                   double avgAUC=eval.AUCs.elementSum()/eval.AUCs.getNumElements();
+		                   stateString+="UserTest Data AUC: "+avgAUC;
+		              	 eval.eval(new ArrayList<Tree>( devTrees.subList( devTrees.size()/2+1,devTrees.size()) ) );
+		                   eval.printSummary();
+		                   avgAUC=eval.AUCs.elementSum()/eval.AUCs.getNumElements();
+		                   stateString+="-------SplitTest Data AUC: "+avgAUC;
+		                   if(bestAccuracy.get(0)<avgAUC)
+		                   {
+		                	   System.out.println("current best model :"+ bestModelStr);
+		                	   bestAccuracy.set(0,avgAUC);
+		                	   bestModelStr.set(0, stateString);
+		                	   bestModel.set(0, new MotifSentimentModel(model.op, trainingTrees));
+//		                	   bestModel.vectorToParams(modelForTest.paramsToVector());
+		                	   model.saveSerialized(modelPath+".best.gz");
+		                   }
+		                   
+		              }
+		              else
+		              {
+		              eval.eval(devTrees);
+		              eval.printSummary();
+		              }
+//		              score =1/eval.rootPredictionError; //eval.exactNodeAccuracy() * 100.0;
+		            } 
+		            model.saveSerialized(OneTrainingBatchThread.tempPath);
+	    		}
+	    		// redo testing to make sure we test with final model
+    		    long totalElapsed = timing.report();
+    			double score = 0.0;
 	            System.err.println("======================================");
-	            System.out.println("Finished epoch " + epoch + "; total training time " + totalElapsed + " ms");
+	            System.out.println("Finished training step " + trainingStep + "; total training time " + totalElapsed + " ms");
 	            if (devTrees != null) {
 	              MotifEvaluate eval = new MotifEvaluate(model);
 	              if(Utils.RNNdoubleTest)
@@ -246,13 +251,13 @@ public class MotifSentimentTraining {
 	                   eval.printSummary();
 	                   avgAUC=eval.AUCs.elementSum()/eval.AUCs.getNumElements();
 	                   stateString+="-------SplitTest Data AUC: "+avgAUC;
-	                   if(bestAccuracy<avgAUC)
+	                   if(bestAccuracy.get(0)<avgAUC)
 	                   {
-	                	   System.out.println("current best model :"+bestModelStr);
-	                	   bestAccuracy=avgAUC;
-	                	   bestModelStr=stateString;
-	                	   bestModel=new MotifSentimentModel(model.op, trainingTrees);
-	                	   bestModel.vectorToParams(model.paramsToVector());
+	                	   System.out.println("current best model :"+ bestModelStr);
+	                	   bestAccuracy.set(0,avgAUC);
+	                	   bestModelStr.set(0, stateString);
+	                	   bestModel.set(0, new MotifSentimentModel(model.op, trainingTrees));
+//	                	   bestModel.vectorToParams(modelForTest.paramsToVector());
 	                	   model.saveSerialized(modelPath+".best.gz");
 	                   }
 	                   
@@ -265,28 +270,95 @@ public class MotifSentimentTraining {
 //	              score =1/eval.rootPredictionError; //eval.exactNodeAccuracy() * 100.0;
 	            } 
 	            model.saveSerialized(OneTrainingBatchThread.tempPath);
-	          }
-	        
-	      
-	      //check the investigate examples:
-	      if(Utils.findNonExchangableExample)
-	      {
-		      List<List<Tree>> succExamples = ExampleFinder.predictableExamples(model, InvestigateExamples);
-		      System.out.println("Number of Success Examples is "+succExamples.size());
-		      if(succExamples.size()>0)
-		      {
-		    	  System.out.println("First Success Example:");
-		    	  List<Tree> succ_example = succExamples.get(0);
-		    	  for (int i = 0; i <succ_example.size(); i++) {
-		    		  System.out.println("true:"+succ_example.get(i));
-		    		  Tree pred = succ_example.get(i).deepCopy();
-		    		  Predict_SetLabel(model, pred);
-		    		  System.out.println("pred:"+pred);
-				}
-		      }
-	      }
+	    		return null;
+	    	}
+	    });
+	    
+	    
+	    /*
+	     * Implements asynchronuous calls for training
+	     */
+	    
+	    for(int i=0; i<numTrainingSteps; i++){
+	    	completionService.submit(new Callable<Pair<double[], double[]>>(){
+		    	public Pair<double[], double[]> call() throws Exception{
 
-	    }    
+		  	      	List<Integer> indices = new ArrayList<Integer>();
+		  	      	for(int i=0;i<trainingTrees.size();i++) {indices.add(i);}
+		  	      	Collections.shuffle(indices, model.rand);
+		  	      	List< Pair< TrainHolder, Broadcast<List<Tree>>  > > parameters = new ArrayList< Pair<TrainHolder, Broadcast<List<Tree>> > >();
+		  	      	
+		  	      	for(int j=0 ; j<batchIteration ; j++){
+		  	      		parameters.add(new Pair<TrainHolder, Broadcast< List<Tree> > >(new TrainHolder(model, sumGradSquare, new ArrayList<Integer>(indices.subList(0, model.op.trainOptions.batchSize-1)) ), broadcastTrainingTrees));	    	  
+		  	      	}
+			      
+		  	      	JavaRDD< Pair< TrainHolder, Broadcast<List<Tree>>  > > parallelParameters = sc.parallelize(parameters);
+
+		  	      	Pair<double[], double[]> parameterChange = parallelParameters.map(executeOneTrainingInParallel).first();
+//		  	      			.reduce(
+//			  	    		  new Function2<Pair<double[], double[]> , Pair<double[], double[]>, Pair<double[], double[]>>(){
+//				    			  public Pair<double[], double[]> call(Pair<double[], double[]> a, Pair<double[], double[]> b){
+//				    				  return new Pair<double[], double[]>(Utils.sumArray(a.first,b.first), Utils.sumArray(a.second,b.second));
+//				    			  }
+//				    		  });
+
+		  	      	
+		    		return parameterChange;
+		    	}
+		    }
+	       );
+	    }
+	    
+	    for (int i = 0; i < numTrainingSteps+1; i++) {
+	    	Pair<double[], double[]> parameterChange;
+
+        	System.err.println(i + "th steps finished?");
+            try {
+            	parameterChange = completionService.take().get(); // find the first completed task
+            	if(parameterChange != null){
+            		// updates parameters
+		  	      	double[] theta = model.paramsToVector();
+		  	      	theta = Utils.sumArray(theta, parameterChange.first);
+		  	      	model.vectorToParams(theta);
+		  	      	
+		  	      	for(int j=0 ; j < sumGradSquare.length; j++){
+		  	      		sumGradSquare[j] += parameterChange.second[j];
+		  	      	}
+
+		  	      	increaseSteps();
+		  	      	
+		  	      	if (trainingStep > 0 && model.op.trainOptions.adagradResetFrequency > 0 && 
+		  		          (trainingStep % numBatches == 0)) {
+		  		        System.err.println("Resetting adagrad weights to " + model.op.trainOptions.initialAdagradWeight);
+		  		        
+		  		        Arrays.fill(sumGradSquare, model.op.trainOptions.initialAdagradWeight);
+		  		        System.gc();
+		  		        
+		  			    // not sure this if statement should be here
+		  			    if(Utils.findNonExchangableExample)
+		  			      {
+		  				      List<List<Tree>> succExamples = ExampleFinder.predictableExamples(model, InvestigateExamples);
+		  				      System.out.println("Number of Success Examples is "+succExamples.size());
+		  				      if(succExamples.size()>0)
+		  				      {
+		  				    	  System.out.println("First Success Example:");
+		  				    	  List<Tree> succ_example = succExamples.get(0);
+		  				    	  for (int j = 0; j <succ_example.size(); j++) {
+		  				    		  System.out.println("true:"+succ_example.get(j));
+		  				    		  Tree pred = succ_example.get(j).deepCopy();
+		  				    		  Predict_SetLabel(model, pred);
+		  				    		  System.out.println("pred:"+pred);
+		  						}
+		  				      }
+		  			      }
+		  	      	}
+            	}
+            	System.err.println(i + "th steps finished");
+            } catch (InterruptedException e) {
+            } catch (ExecutionException e) {
+            }
+        }
+	    
 	      //check the investigate examples:
 	    if(Utils.findNonExchangableExample)
 	    {
@@ -311,7 +383,7 @@ public class MotifSentimentTraining {
 		System.out.println("Total Elapsed Time is "+ timing.report()/1000+" secondes");
 //		if(bestCost<allbatchCost_last)
 //		{
-		model=bestModel;
+		inputModel=bestModel.get(0);
 		 System.out.println("current best model :"+bestModelStr);
 //         if (devTrees != null) {
 //             MotifEvaluate eval = new MotifEvaluate(model);
@@ -320,7 +392,7 @@ public class MotifSentimentTraining {
 ////             score =1/eval.rootPredictionError; //eval.exactNodeAccuracy() * 100.0;
 //           }
 //		}
-		return bestModel;
+		return bestModel.get(0);
 	  }
 
   public static void train(MotifSentimentModel model, String modelPath, List<Tree> trainingTrees, List<Tree> devTrees) {
@@ -494,7 +566,7 @@ public class MotifSentimentTraining {
     boolean useTensor=false;
     String modelPath = null;
     int numthreads=1;
-    
+    int batchIteration = 1;
     
     op.trainOptions.epochs=10000;   //-epochs
     op.trainOptions.regClassification=0.0001; //-regClassification
@@ -517,6 +589,9 @@ public class MotifSentimentTraining {
         argIndex++;
       } else if (args[argIndex].equalsIgnoreCase("-threads")) {
     	  numthreads = Integer.valueOf(args[argIndex + 1]);
+    	  argIndex += 2;
+      } else if (args[argIndex].equalsIgnoreCase("-batchIteration")) {
+    	  batchIteration = Integer.valueOf(args[argIndex + 1]);
     	  argIndex += 2;
       } else if (args[argIndex].equalsIgnoreCase("-trainpath")) { // training data
         trainPath = args[argIndex + 1];
@@ -616,16 +691,17 @@ public class MotifSentimentTraining {
         
     	model= new MotifSentimentModel(op, trainingTrees);
     	
+    	// Spark configuration and broadcast training tree
 		SparkConf conf = new SparkConf().setAppName("MotifSentimentTraining");
 		JavaSparkContext sc = new JavaSparkContext(conf);
 		Broadcast<List<Tree>> broadcastTrainingTrees = sc.broadcast(trainingTrees);
-		Accumulable<MotifSentimentModel, double[]> accumulatorModel = sc.accumulable(model, new MotifSentimentModelAccumulatorParam());
+		System.gc();
 		
     	if(numthreads>=1)
     	{	model.op.trainOptions.batchSize=trainingTrees.size()/numthreads/2;
     		if(model.op.trainOptions.batchSize>10000)
     			model.op.trainOptions.batchSize=10000;
-    		model=train_multiThread(accumulatorModel, trainPath+".model"+ op.randomSeed, sc, broadcastTrainingTrees, devTrees, numthreads); //make sure final return bestmodel
+    		model=train_multiThread(model, trainPath+".model"+ op.randomSeed, sc, broadcastTrainingTrees, devTrees, numthreads, batchIteration); //make sure final return bestmodel
     	} //always use multi-thread version
 //    	else
 //    		train(model, trainPath+".model"+ op.randomSeed, trainingTrees, devTrees);
