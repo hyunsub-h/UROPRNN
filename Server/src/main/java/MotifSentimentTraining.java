@@ -56,7 +56,6 @@ public class MotifSentimentTraining {
 	  trainingStep++;
   }
   /*
-   * @author Hyun Sub
    * Map function that trains model and return the differences in theta (in model) and sumGradSquare 
    */
 	public static Function< Pair<TrainHolder, Broadcast<List<Tree>>  >, Pair<double[], double[]> > executeOneTrainingInParallel = new Function< Pair<TrainHolder, Broadcast<List<Tree>> >, Pair<double[], double[] >>(){
